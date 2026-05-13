@@ -1,0 +1,105 @@
+name: Mirror LTX-2.3 distilled weights to Artifactory
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "Source URL on HuggingFace"
+        required: true
+        default: "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-1.1.safetensors"
+      target_url:
+        description: "Target URL on Artifactory"
+        required: true
+        default: "https://artifactory.prod.boscharena.ai:443/artifactory/pjw3_generic_public/000_zhouyi/public/models/ltx-2/safetensors/ltx-2.3-22b-distilled-1.1.safetensors"
+
+concurrency:
+  group: mirror-ltx-distilled
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Show available disk space
+        run: df -h
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Stream download from HuggingFace and upload to Artifactory
+        env:
+          SOURCE_URL: ${{ github.event.inputs.source_url }}
+          TARGET_URL: ${{ github.event.inputs.target_url }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ARTIFACTORY_USER: ${{ secrets.ARTIFACTORY_USER }}
+          ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ARTIFACTORY_USER:-}" ] || [ -z "${ARTIFACTORY_TOKEN:-}" ]; then
+            echo "ERROR: ARTIFACTORY_USER and ARTIFACTORY_TOKEN secrets must be set." >&2
+            exit 1
+          fi
+
+          # Optional HuggingFace auth header (used only if HF_TOKEN is provided).
+          HF_AUTH_ARGS=()
+          if [ -n "${HF_TOKEN:-}" ]; then
+            HF_AUTH_ARGS=(-H "Authorization: Bearer ${HF_TOKEN}")
+          fi
+
+          # Resolve final redirect URL and total size from HuggingFace without
+          # downloading the body. This lets us pass Content-Length on PUT so
+          # Artifactory does not need chunked transfer encoding.
+          echo "Resolving source URL and size..."
+          HEADERS=$(curl -sSIL "${HF_AUTH_ARGS[@]}" "$SOURCE_URL")
+          echo "$HEADERS"
+
+          SIZE=$(printf '%s' "$HEADERS" \
+            | awk 'BEGIN{IGNORECASE=1} /^content-length:/ {v=$2} END{gsub(/\r/,"",v); print v}')
+
+          if ! [[ "$SIZE" =~ ^[0-9]+$ ]] || [ "$SIZE" -le 0 ]; then
+            echo "ERROR: could not determine source content length (got: '$SIZE')." >&2
+            exit 1
+          fi
+          echo "Source size: $SIZE bytes ($(numfmt --to=iec --suffix=B "$SIZE"))"
+
+          # Stream: curl (download) | curl (upload PUT to Artifactory).
+          # -T - reads body from stdin; we pass Content-Length explicitly so the
+          # upload is a single non-chunked PUT, which Artifactory handles best.
+          echo "Starting streaming transfer..."
+          set -o pipefail
+          curl --fail --location --silent --show-error \
+               --retry 5 --retry-delay 10 --retry-all-errors \
+               "${HF_AUTH_ARGS[@]}" \
+               "$SOURCE_URL" \
+            | curl --fail --silent --show-error \
+                   --retry 5 --retry-delay 10 --retry-all-errors \
+                   -u "${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN}" \
+                   -H "Content-Length: ${SIZE}" \
+                   -H "Expect:" \
+                   -X PUT \
+                   -T - \
+                   "$TARGET_URL"
+
+          echo
+          echo "Verifying upload via HEAD..."
+          UP_HEADERS=$(curl -sSI -u "${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN}" "$TARGET_URL")
+          echo "$UP_HEADERS"
+
+          UP_SIZE=$(printf '%s' "$UP_HEADERS" \
+            | awk 'BEGIN{IGNORECASE=1} /^content-length:/ {v=$2} END{gsub(/\r/,"",v); print v}')
+          echo "Uploaded size: $UP_SIZE bytes"
+
+          if [ "$UP_SIZE" != "$SIZE" ]; then
+            echo "ERROR: uploaded size ($UP_SIZE) does not match source size ($SIZE)." >&2
+            exit 1
+          fi
+          echo "Mirror succeeded."
+
+      - name: Show disk space after run
+        if: always()
+        run: df -h
