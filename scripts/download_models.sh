@@ -56,6 +56,14 @@ hf_hub_download(
     token=token,
 )
 
+print("Downloading IC-LoRA Union Control for video conditioning...")
+hf_hub_download(
+    repo_id="Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control",
+    filename="ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
+    local_dir=model_dir,
+    token=token,
+)
+
 print("Downloading Gemma text encoder...")
 try:
     snapshot_download(
